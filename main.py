@@ -6,8 +6,12 @@ from datetime import datetime, timezone, timedelta
 # 从同级目录的 config.py 文件中导入我们的配置
 try:
     from . import config
+    from .parser import extract_password
+    from .notifier import send_email_alert
 except ImportError:
     import config
+    from parser import extract_password
+    from notifier import send_email_alert
 
 
 def run_bot():
@@ -32,8 +36,8 @@ def run_bot():
             # 获取当前的UTC时间
             now = datetime.now(timezone.utc)
             # 计算起始时间（例如：20分钟前）
-            # 我们稍微多减一点时间（比如+60秒），作为网络延迟等的缓冲
-            start_time_dt = now - timedelta(seconds=config.POLLING_INTERVAL_SECONDS + 60)
+            # 我们稍微多减一点时间（比如+5秒），作为网络延迟等的缓冲
+            start_time_dt = now - timedelta(seconds=config.POLLING_INTERVAL_SECONDS + 5)
             # 将时间格式化为 Twitter API 要求的 RFC 3339 格式
             start_time_str = start_time_dt.isoformat()
 
@@ -51,20 +55,22 @@ def run_bot():
                 print(f"🎉 发现 {len(response.data)} 条通过[服务器端]过滤的推文！")
 
                 # Twitter 默认返回的是从新到旧，为了逻辑清晰，我们反转一下
+                # Twitter默认返回结果是从新到旧，我们反转它，按时间顺序处理
                 for tweet in reversed(response.data):
-                    print(f"\n--- 处理推文ID: {tweet.id} ---")
-                    print(f"发布于: {tweet.created_at}")
-                    print(f"内容: {tweet.text}")
+                    print(f"\n--- 处理推文ID: {tweet.id} | 发布于: {tweet.created_at} ---")
 
-                    # 在这里，我们不再需要客户端时效性过滤，因为服务器已经帮我们做好了
+                    # --- 2d. 调用解析器 ---
+                    password = extract_password(tweet.text)  # 此函数来自 parser.py
 
-                    # password = extract_password(tweet.text)
-                    # if password:
-                    #     print(f"💰 成功提取到口令: {password}")
-                    #     tweet_url = f"https://twitter.com/anyuser/status/{tweet.id}"
-                    #     # send_email_alert(password, tweet_url)
-                    # else:
-                    #     print("🤷 未在该推文中发现格式化口令。")
+                    if password:
+                        # 如果解析器返回了结果（不是None）
+                        print(f"💰 成功提取到口令: {password}")
+                        tweet_url = f"https://twitter.com/anyuser/status/{tweet.id}"
+
+                        # --- 2e. 调用通知器 ---
+                        print("🚀 发现目标！正在调用邮件通知...")
+                        send_email_alert(password, tweet_url)  # 此函数来自 notifier.py
+                    # 如果password是None，解析器的日志已经打印了“未匹配”，这里无需额外打印
 
             else:
                 print("💨 本轮没有发现符合所有过滤条件的推文。")
