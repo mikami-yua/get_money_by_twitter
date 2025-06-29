@@ -2,6 +2,8 @@
 import tweepy
 import time
 from datetime import datetime, timezone, timedelta
+import json
+from pathlib import Path
 
 # 从同级目录的 config.py 文件中导入我们的配置
 try:
@@ -13,9 +15,50 @@ except ImportError:
     from parser import extract_password
     from notifier import send_red_packet_alert, send_system_alert
 
+
+STATE_FILE = Path("state.json")
 # --- 新增的健康检测配置 ---
 MAX_CONSECUTIVE_FAILURES = 3
 
+MAX_SAVED_IDS = 10  # 新增配置：最多保存10个历史ID
+
+
+def load_last_tweet_id() -> str | None:
+    """从state.json加载ID列表，并返回最新的一个ID"""
+    if STATE_FILE.exists():
+        with open(STATE_FILE, 'r') as f:
+            try:
+                state = json.load(f)
+                # state['processed_ids'] 是一个列表，最新的在最后
+                if state.get('processed_ids'):
+                    return state['processed_ids'][-1]
+            except (json.JSONDecodeError, KeyError):
+                return None
+    return None
+
+
+def save_last_tweet_id(tweet_id: str):
+    """将新的ID加入列表，并维护列表大小不超过MAX_SAVED_IDS"""
+    history_ids = []
+    if STATE_FILE.exists():
+        with open(STATE_FILE, 'r') as f:
+            try:
+                state = json.load(f)
+                if isinstance(state.get('processed_ids'), list):
+                    history_ids = state['processed_ids']
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    # 将新的ID追加到列表末尾
+    history_ids.append(tweet_id)
+
+    # 如果列表超长，就从前面删除旧的ID
+    while len(history_ids) > MAX_SAVED_IDS:
+        history_ids.pop(0)
+
+    # 将更新后的列表写回文件
+    with open(STATE_FILE, 'w') as f:
+        json.dump({'processed_ids': history_ids}, f)
 
 def get_next_active_account_index(accounts: list, current_index: int) -> int:
     """从当前索引的下一个开始，寻找并返回活动账户的索引"""
@@ -29,90 +72,31 @@ def get_next_active_account_index(accounts: list, current_index: int) -> int:
             return next_index
     return -1  # 返回-1表示没有可用的活动账户了
 
-def run_bot1():
-    """程序主函数，使用 start_time 机制进行高精度、时效性过滤"""
-    print("▶️ 启动Twitter监控机器人 (start_time 极限过滤模式)...")
-
-    # 我们使用单账户配置
-    account = config.ACCOUNTS[4]
-    client = tweepy.Client(
-        bearer_token=account['bearer_token'],
-        consumer_key=account['api_key'],
-        consumer_secret=account['api_secret'],
-        access_token=account['access_token'],
-        access_token_secret=account['access_token_secret'],
-        wait_on_rate_limit=True
-    )
-    print(f"✅ 客户端初始化成功，使用账户: {account['name']}")
-
-    while True:
-        try:
-            # --- 核心改动：动态计算 start_time ---
-            # 获取当前的UTC时间
-            now = datetime.now(timezone.utc)
-            # 计算起始时间（例如：20分钟前）
-            # 我们稍微多减一点时间（比如+5秒），作为网络延迟等的缓冲
-            start_time_dt = now - timedelta(seconds=config.POLLING_INTERVAL_SECONDS + 5)
-            # 将时间格式化为 Twitter API 要求的 RFC 3339 格式
-            start_time_str = start_time_dt.isoformat()
-
-            print(f"\n🔍 正在搜索 {start_time_str} 之后的新推文...")
-
-            response = client.search_recent_tweets(
-                query=config.SEARCH_QUERY,
-                start_time=start_time_str,  # 使用 start_time 参数
-                tweet_fields=["created_at"],
-                max_results=10
-            )
-
-            # --- 后续处理逻辑不变 ---
-            if response.data:
-                print(f"🎉 发现 {len(response.data)} 条通过[服务器端]过滤的推文！")
-
-                # Twitter 默认返回的是从新到旧，为了逻辑清晰，我们反转一下
-                # Twitter默认返回结果是从新到旧，我们反转它，按时间顺序处理
-                for tweet in reversed(response.data):
-                    print(f"\n--- 处理推文ID: {tweet.id} | 发布于: {tweet.created_at} ---")
-
-                    # --- 2d. 调用解析器 ---
-                    password = extract_password(tweet.text)  # 此函数来自 parser.py
-
-                    if password:
-                        # 如果解析器返回了结果（不是None）
-                        print(f"💰 成功提取到口令: {password}")
-                        tweet_url = f"https://twitter.com/anyuser/status/{tweet.id}"
-
-                        # --- 2e. 调用通知器 ---
-                        print("🚀 发现目标！正在调用邮件通知...")
-                        send_email_alert(password, tweet_url)  # 此函数来自 notifier.py
-                    # 如果password是None，解析器的日志已经打印了“未匹配”，这里无需额外打印
-
-            else:
-                print("💨 本轮没有发现符合所有过滤条件的推文。")
-
-        except Exception as e:
-            print(f"❌ 发生错误: {e}")
-
-        print(f"\n😴 等待 {config.POLLING_INTERVAL_SECONDS} 秒后进行下一轮搜索...")
-        time.sleep(config.POLLING_INTERVAL_SECONDS)
-
 
 def run_bot():
-    print("▶️ 启动Twitter监控机器人 (5账号高速轮换模式)...")
+    """
+    程序主函数 (最终版)
+    集成了多账户轮换、健康检测、精准去重、ID历史记录和推文日志功能。
+    """
+    print("▶️ 启动Twitter监控机器人...")
 
+    # --- 1. 初始化账户状态和失败计数器 ---
     accounts = config.ACCOUNTS
-    if len(accounts) < 5:
-        print(f"⚠️ 警告：当前配置了 {len(accounts)} 个账户，不足5个。可能无法达到3分钟的更新频率。")
-
     for acc in accounts:
         acc['status'] = 'active'
 
     failure_counts = {acc['name']: 0 for acc in accounts}
-    current_account_index = -1  # 确保从第一个账户开始
+    current_account_index = -1
 
-    # --- 主循环 ---
+    # --- 2. 加载最新的“书签”ID ---
+    last_id = load_last_tweet_id()
+    if last_id:
+        print(f"ℹ️ 已加载上次处理到的推文ID (书签): {last_id}")
+    else:
+        print("ℹ️ 未发现历史状态，将从最新的推文开始搜索。")
+
+    # --- 3. 进入主循环 ---
     while True:
-        # --- 1. 获取下一个健康的账户 ---
         current_account_index = get_next_active_account_index(accounts, current_account_index)
 
         if current_account_index == -1:
@@ -124,63 +108,83 @@ def run_bot():
         client = None
 
         try:
-            # --- 2. 初始化客户端并请求 ---
+            # --- 3a. 初始化客户端 ---
             print(f"\n🔄 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 切换到账户: {account['name']}")
-            client = tweepy.Client(bearer_token=account['bearer_token'])  # 不再自动等待速率限制
+            client = tweepy.Client(bearer_token=account['bearer_token'])
 
+            # --- 3b. 发起API请求 ---
+            # 同时使用 start_time 和 since_id 来实现最高效的精准去重
             now = datetime.now(timezone.utc)
-            # 时间窗口应该是“账号数 * 轮询间隔”，确保不漏数据
-            time_window = len(accounts) * config.POLLING_INTERVAL_SECONDS
-            start_time_dt = now - timedelta(seconds=time_window)
+            start_time_dt = now - timedelta(days=1)
             start_time_str = start_time_dt.isoformat()
 
-            print(f"🔍 正在搜索...")
+            print(f"🔍 正在搜索 (书签ID: {last_id})...")
             response = client.search_recent_tweets(
-                query=config.SEARCH_QUERY, start_time=start_time_str,
-                tweet_fields=["created_at"], max_results=10
+                query=config.SEARCH_QUERY,
+                since_id=last_id,
+                start_time=start_time_str,
+                tweet_fields=["created_at"],
+                max_results=10
             )
 
-            # --- 请求成功，重置失败计数 ---
+            # --- 请求成功，重置该账户的失败计数器 ---
             if failure_counts[account['name']] > 0:
-                print(f"✅ 账户 '{account['name']}' 已恢复，失败计数清零。")
                 failure_counts[account['name']] = 0
+                print(f"✅ 账户 '{account['name']}' 已恢复，失败计数清零。")
 
-            # --- 3. 处理结果 ---
+            # --- 3c. 处理返回结果 ---
             if response.data:
-                print(f"🎉 发现 {len(response.data)} 条符合条件的推文！")
+                print(f"🎉 发现 {len(response.data)} 条新推文！")
+
+                # --- !! 新功能：将所有下载的推文写入日志 !! ---
+                try:
+                    with open("twitter.log", "a", encoding="utf-8") as log_file:
+                        log_file.write(
+                            f"\n===== BATCH at {datetime.now().isoformat()} | Account: {account['name']} =====\n")
+                        for tweet in response.data:
+                            log_file.write(f"ID: {tweet.id} | Created at: {tweet.created_at}\n")
+                            log_file.write(tweet.text.replace('\n', ' ') + '\n')
+                            log_file.write("-" * 20 + "\n")
+                    print("✍️  已将获取到的推文追加到 twitter.log 文件。")
+                except Exception as log_e:
+                    print(f"❌ 写入日志文件失败: {log_e}")
+                # --- 日志记录结束 ---
+
+                # --- 3d. 更新“书签”ID ---
+                newest_id_in_batch = response.meta.get('newest_id')
+                if newest_id_in_batch:
+                    last_id = newest_id_in_batch
+                    save_last_tweet_id(last_id)
+                    print(f"ℹ️ 书签已更新为: {last_id}")
+
+                # --- 3e. 遍历推文进行解析和通知 ---
                 for tweet in reversed(response.data):
+                    print(f"\n--- 正在处理推文ID: {tweet.id} ---")
                     password = extract_password(tweet.text)
                     if password:
                         tweet_url = f"https://twitter.com/anyuser/status/{tweet.id}"
                         send_red_packet_alert(password, tweet_url)
             else:
-                print("💨 本轮没有发现符合条件的推文。")
-
-        except tweepy.errors.TooManyRequests:
-            # --- 4a. 如果是速率超限，这是“正常”的，直接进入休眠，等待下一个账号 ---
-            print(f"⌛️ 账户 '{account['name']}' 本轮请求机会已用完（正常现象），等待轮换。")
-            # 请求成功，重置失败计数
-            if failure_counts[account['name']] > 0:
-                print(f"✅ 账户 '{account['name']}' 已恢复，失败计数清零。")
-                failure_counts[account['name']] = 0
+                print("💨 本轮没有发现新推文。")
 
         except Exception as e:
-            # --- 4b. 如果是其他错误，则增加失败计数 ---
+            # --- 3f. 错误处理与健康检测 ---
             print(f"⚠️ 账户 '{account['name']}' 发生未知错误: {e}")
             failure_counts[account['name']] += 1
             print(f"    -> 连续失败次数: {failure_counts[account['name']]}/{MAX_CONSECUTIVE_FAILURES}")
 
             if failure_counts[account['name']] >= MAX_CONSECUTIVE_FAILURES:
-                print(f"🚨 警报！账户 '{account['name']}' 已连续失败 {MAX_CONSECUTIVE_FAILURES} 次，将被禁用！")
                 account['status'] = 'disabled'
-
+                print(f"🚨 警报！账户 '{account['name']}' 已被禁用！")
                 alert_subject = f"账号失效警告：{account['name']}"
                 alert_body = f"账号 '{account['name']}' (Email: {account['emailid']}) 已被自动禁用，最后一次错误: {e}"
                 send_system_alert(alert_subject, alert_body)
 
-        # --- 5. 等待下一个轮询周期 ---
-        print(f"😴 等待 {config.POLLING_INTERVAL_SECONDS} 秒后，轮换到下一个账号...")
+        # --- 3g. 等待下一个轮询周期 ---
+        print(f"\n😴 等待 {config.POLLING_INTERVAL_SECONDS} 秒...")
         time.sleep(config.POLLING_INTERVAL_SECONDS)
+
+    print("\n\n🚨 所有账户均已失效或没有可用账户，程序退出。")
 
 if __name__ == "__main__":
     run_bot()
