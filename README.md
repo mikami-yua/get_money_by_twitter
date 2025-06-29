@@ -1,6 +1,4 @@
-# get_money_by_twitter
-
-# 高可用Twitter关键词监控与通知机器人
+# Twitter捡钱机器人
 
 一个能7x24小时自动监控Twitter，精准捕捉“口令红包”、“Web3空投”等时效性信息，并通过邮件实时告警的智能机器人。
 
